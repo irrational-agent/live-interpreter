@@ -105,21 +105,58 @@ pub async fn clone(
 }
 
 /// Records the microphone to a mono 16-bit WAV, showing a level meter. Ctrl+C stops early.
+/// A passage to read aloud while recording: questions, exclamations, numbers and calm narration,
+/// so the clone hears the voice in different intonations.
+const READING_TEXT: &str = "\
+Привіт! Зараз я записую свій голос, щоб перевірити, як працює клонування. День сьогодні звичайний:
+зранку я випив каву, переглянув новини й трохи попрацював. Чи знаєте ви, скільки мов існує у світі?
+Кажуть, понад сім тисяч. Я розмовляю українською, а мій цифровий двійник, можливо, скоро заговорить
+японською. Це звучить трохи дивно, але водночас дуже цікаво!
+
+Уявіть, що ви вперше приїхали в Токіо. Довкола яскраві вивіски, люди поспішають у метро, а ви шукаєте
+потрібну станцію. Ви підходите до перехожого й питаєте дорогу, а телефон одразу перекладає ваші слова
+вашим же голосом. Колись це здавалося фантастикою, а тепер це звичайна програма на комп'ютері.
+
+Тепер кілька чисел: один, два, три, двадцять п'ять, сто сорок сім. Двадцять перше листопада, о пів на
+восьму вечора.
+
+Наостанок скажу щось спокійно й повільно. Добре, коли технології допомагають людям розуміти одне
+одного. Дякую, що вислухали!";
+
+async fn wait_for_enter() -> Result<()> {
+    tokio::task::spawn_blocking(|| {
+        let mut line = String::new();
+        std::io::stdin().read_line(&mut line).map(|_| ())
+    })
+    .await??;
+    Ok(())
+}
+
+/// Records the microphone to a mono 16-bit WAV, showing a level meter. Ctrl+C stops early.
+/// Afterwards it reports level, clipping and pauses, which decide how good the clone will be.
 pub async fn record(path: &Path, seconds: u32, device: Option<&str>) -> Result<()> {
-    let (mic, mut rx) = Mic::start(device)?;
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
+    println!("Запис зразка голосу для клону: {seconds} с, файл {}.\n", path.display());
+    println!("Говори природно, своїм звичайним тоном, у тихій кімнаті, без музики й телевізора.");
+    println!("Можна прочитати текст нижче, а коли він закінчиться, просто говорити про будь-що.\n");
+    println!("{READING_TEXT}\n");
+    println!("Натисни Enter, щоб почати запис (Ctrl+C — скасувати).");
+    wait_for_enter().await?;
+
+    let (mic, mut rx) = Mic::start(device)?;
     let spec = hound::WavSpec { channels: 1, sample_rate: mic.rate, bits_per_sample: 16, sample_format: hound::SampleFormat::Int };
     let mut writer = hound::WavWriter::create(path, spec)?;
-    println!("Мікрофон: {} ({} Гц). Запис {seconds} с, Ctrl+C — зупинити раніше.", mic.name, mic.rate);
-    println!("Говори природно, як зазвичай, без пауз по кілька секунд. Тиша й шум погіршують клон.\n");
+    println!("Пишу з мікрофона «{}» ({} Гц). Ctrl+C зупинить запис раніше.\n", mic.name, mic.rate);
 
     let total = mic.rate as u64 * seconds as u64;
+    let window = (mic.rate / 20) as u64; // 50 ms, for the pause statistics
     let mut written = 0u64;
-    let mut peak = 0f32;
-    let mut sum_sq = 0f64;
-    let mut n = 0u64;
+    let (mut peak, mut sum_sq, mut n) = (0f32, 0f64, 0u64); // for the live meter
+    let (mut peak_all, mut clipped) = (0f32, 0u64);
+    let (mut win_sq, mut win_n) = (0f64, 0u64);
+    let (mut speech_sq, mut speech_n, mut windows, mut silent_windows) = (0f64, 0u64, 0u64, 0u64);
     let mut last_draw = Instant::now();
     let ctrl_c = tokio::signal::ctrl_c();
     tokio::pin!(ctrl_c);
@@ -129,9 +166,18 @@ pub async fn record(path: &Path, seconds: u32, device: Option<&str>) -> Result<(
                 let Some(block) = block else { break };
                 for &s in block.iter().take((total - written) as usize) {
                     writer.write_sample(f32_to_i16(s))?;
+                    let sq = (s as f64) * (s as f64);
                     peak = peak.max(s.abs());
-                    sum_sq += (s as f64) * (s as f64);
-                    n += 1;
+                    peak_all = peak_all.max(s.abs());
+                    if s.abs() >= 0.99 { clipped += 1; }
+                    sum_sq += sq; n += 1;
+                    win_sq += sq; win_n += 1;
+                    if win_n == window {
+                        windows += 1;
+                        let db = 10.0 * (win_sq / win_n as f64).max(1e-12).log10();
+                        if db < -45.0 { silent_windows += 1; } else { speech_sq += win_sq; speech_n += win_n; }
+                        win_sq = 0.0; win_n = 0;
+                    }
                 }
                 written += block.len() as u64;
                 if last_draw.elapsed() > Duration::from_millis(150) {
@@ -151,7 +197,32 @@ pub async fn record(path: &Path, seconds: u32, device: Option<&str>) -> Result<(
         }
     }
     writer.finalize()?;
+
     let secs = written.min(total) as f64 / mic.rate as f64;
-    println!("\n\nЗбережено {:.0} с у {}", secs, path.display());
+    let speech_db = if speech_n > 0 { 10.0 * (speech_sq / speech_n as f64).log10() } else { -99.0 };
+    let pauses = if windows > 0 { silent_windows as f64 / windows as f64 * 100.0 } else { 100.0 };
+    println!("\n\nЗбережено {secs:.0} с у {}", path.display());
+    println!("Гучність мовлення: {speech_db:.0} дБ, пік: {:.0} дБ, тиша: {pauses:.0}% запису.", 20.0 * peak_all.max(1e-5).log10());
+    let mut ok = true;
+    if secs < 45.0 {
+        ok = false;
+        println!("  ! Запис коротший за 45 с. Для клону краще 1-2 хвилини мовлення.");
+    }
+    if clipped > mic.rate as u64 / 10 {
+        ok = false;
+        println!("  ! Звук часто перевантажений, клон може хрипіти. Говори тихіше або відсунь мікрофон.");
+    }
+    if speech_db < -35.0 {
+        ok = false;
+        println!("  ! Мовлення дуже тихе. Підсунь мікрофон або збільш його гучність.");
+    }
+    if pauses > 40.0 {
+        ok = false;
+        println!("  ! Тиша займає понад 40% запису. Довгі паузи краще вирізати або перезаписати.");
+    }
+    if ok {
+        println!("Запис придатний для клону.");
+    }
+    println!("\nДалі: live-interpreter clone --name \"Мій голос\" {}", path.display());
     Ok(())
 }
