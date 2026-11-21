@@ -353,7 +353,7 @@ async fn run(a: RunArgs) -> Result<()> {
                 Some(stt::SttEvent::Committed(text)) => {
                     ui::clear_partial();
                     let text = text.trim().to_string();
-                    if text.chars().filter(|c| c.is_alphanumeric()).count() >= 2 {
+                    if text.chars().filter(|c| c.is_alphanumeric()).count() >= 2 && !is_filler_only(&text) {
                         ui::line(&format!("{} ▸ {text}", a.lang.from));
                         let _ = seg_tx.send((text, Instant::now()));
                     }
@@ -384,6 +384,28 @@ async fn run(a: RunArgs) -> Result<()> {
         println!("Озвучення збережено.");
     }
     Ok(())
+}
+
+/// True when a segment is only hesitation sounds ("А-а-а.", "Ммм", "uh, um"): nothing to translate.
+fn is_filler_only(text: &str) -> bool {
+    const FILLERS: &[&str] = &[
+        "а", "е", "є", "о", "у", "и", "і", "м", "ам", "ем", "хм", "ну", "uh", "um", "er", "erm", "ah", "eh", "oh",
+        "hm", "m", "a", "e", "o",
+    ];
+    let mut words = text.split(|c: char| !c.is_alphanumeric()).filter(|w| !w.is_empty()).peekable();
+    if words.peek().is_none() {
+        return true;
+    }
+    words.all(|w| {
+        // Collapse stretched sounds: "ааа" -> "а", "мммм" -> "м", "ееем" -> "ем".
+        let mut squeezed = String::new();
+        for c in w.to_lowercase().chars() {
+            if !squeezed.ends_with(c) {
+                squeezed.push(c);
+            }
+        }
+        FILLERS.contains(&squeezed.as_str())
+    })
 }
 
 /// Resamples source audio to 16 kHz, cuts it into 100 ms blocks and sends it to Scribe.
@@ -455,5 +477,56 @@ async fn speak_loop(mut speaker: tts::Tts, mut said: mpsc::UnboundedReceiver<Utt
             Ok(_) => {}
             Err(e) => ui::line(&format!("озвучення не вдалося: {e:#}")),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_filler_only;
+    use crate::translate::{MarkupFilter, SentenceSplitter};
+
+    fn filter_all(pieces: &[&str]) -> String {
+        let mut f = MarkupFilter::default();
+        let mut out: String = pieces.iter().map(|p| f.push(p)).collect();
+        out.push_str(&f.finish());
+        out
+    }
+
+    #[test]
+    fn drops_leaked_thinking_block() {
+        let leaked = "<thinking>The segment is just a hesitation filler, but there is a word, \"Так\" — rendered as ええと in Japanese.</thinking>ええと、あー…";
+        assert_eq!(filter_all(&[leaked]), "ええと、あー…");
+        // Same text split at awkward points while streaming.
+        let chars: Vec<char> = leaked.chars().collect();
+        let pieces: Vec<String> = chars.chunks(3).map(|c| c.iter().collect()).collect();
+        let refs: Vec<&str> = pieces.iter().map(String::as_str).collect();
+        assert_eq!(filter_all(&refs), "ええと、あー…");
+    }
+
+    #[test]
+    fn keeps_text_and_strips_bare_tags() {
+        assert_eq!(filter_all(&["<segment>こんにちは</segment>"]), "こんにちは");
+        assert_eq!(filter_all(&["今日は", "いい天気", "ですね。"]), "今日はいい天気ですね。");
+        assert_eq!(filter_all(&["<context>Привіт</context>はい。"]), "はい。");
+    }
+
+    #[test]
+    fn filler_detection() {
+        assert!(is_filler_only("А-а-а."));
+        assert!(is_filler_only("Ммм..."));
+        assert!(is_filler_only("Ееее, ну"));
+        assert!(!is_filler_only("Так, а-а-а..."));
+        assert!(!is_filler_only("Ну, це дивно."));
+    }
+
+    #[test]
+    fn splits_sentences_while_streaming() {
+        let mut s = SentenceSplitter::default();
+        let mut got = Vec::new();
+        for p in ["こんにちは！今日", "は3.5度です。ま", "た"] {
+            got.extend(s.push(p));
+        }
+        got.extend(s.finish());
+        assert_eq!(got, vec!["こんにちは！", "今日は3.5度です。", "また"]);
     }
 }
