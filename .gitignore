@@ -1,0 +1,9 @@
+/target
+
+# secrets
+.env
+.env.local
+
+# personal voice recordings and generated audio
+samples/
+out/
