@@ -179,6 +179,8 @@ pub async fn record(path: &Path, seconds: u32, device: Option<&str>) -> Result<(
     }
     println!("Запис зразка голосу для клону: {seconds} с, файл {}.\n", path.display());
     println!("Говори природно, своїм звичайним тоном, у тихій кімнаті, без музики й телевізора.");
+    println!("Сядь приблизно за 20 см від мікрофона. Під час мовлення рівень має бути від −23 до −18 дБ.");
+    println!("Клон копіює все, що чує: темп, вагання, дихання й шум, тож говори рівно й без «е-е».");
     println!("Можна прочитати текст нижче, а коли він закінчиться, просто говорити про будь-що.\n");
     println!("{READING_TEXT}\n");
     println!("Натисни Enter, щоб почати запис (Ctrl+C — скасувати).");
@@ -251,9 +253,18 @@ pub async fn record(path: &Path, seconds: u32, device: Option<&str>) -> Result<(
         ok = false;
         println!("  ! Звук часто перевантажений, клон може хрипіти. Говори тихіше або відсунь мікрофон.");
     }
-    if speech_db < -35.0 {
+    // ElevenLabs recommends -23..-18 dB RMS with peaks around -3 dB for cloning samples.
+    let peak_db = 20.0 * peak_all.max(1e-5).log10();
+    if speech_db < -26.0 {
         ok = false;
-        println!("  ! Мовлення дуже тихе. Підсунь мікрофон або збільш його гучність.");
+        println!("  ! Мовлення тихе: ElevenLabs радить від −23 до −18 дБ. Сядь ближче до мікрофона");
+        println!("    (приблизно 20 см) або збільш його гучність і запиши ще раз.");
+    } else if speech_db > -14.0 {
+        ok = false;
+        println!("  ! Мовлення дуже гучне: ElevenLabs радить від −23 до −18 дБ. Відсунь мікрофон або зменш гучність.");
+    }
+    if clipped <= mic.rate as u64 / 10 && peak_db > -1.0 {
+        println!("  ! Піки майже доходять до перевантаження. ElevenLabs радить тримати їх нижче −3 дБ.");
     }
     if pauses > 40.0 {
         ok = false;
