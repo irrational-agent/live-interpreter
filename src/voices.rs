@@ -307,3 +307,60 @@ pub async fn record(path: &Path, seconds: u32, device: Option<&str>) -> Result<(
     println!("\nДалі: live-interpreter clone --name \"Мій голос\" {}", path.display());
     Ok(())
 }
+
+#[cfg(test)]
+mod upload_tests {
+    #[test]
+    fn long_48k_wav_becomes_small_24k_upload() {
+        let dir = std::env::temp_dir().join("li-upload-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("voice.wav");
+        let spec = hound::WavSpec { channels: 1, sample_rate: 48_000, bits_per_sample: 16, sample_format: hound::SampleFormat::Int };
+        let mut w = hound::WavWriter::create(&path, spec).unwrap();
+        for i in 0..48_000 * 120 {
+            let s = (i as f32 * 2.0 * std::f32::consts::PI * 220.0 / 48_000.0).sin() * 0.3;
+            w.write_sample((s * 32767.0) as i16).unwrap();
+        }
+        w.finalize().unwrap();
+        assert!(std::fs::metadata(&path).unwrap().len() > 11 * 1000 * 1000);
+
+        let parts = super::prepare_upload(&path).unwrap();
+        assert_eq!(parts.len(), 1);
+        let (name, data, mime) = &parts[0];
+        assert_eq!((name.as_str(), *mime), ("voice.wav", "audio/wav"));
+        assert!(data.len() < 10 * 1024 * 1024, "upload is {} bytes", data.len());
+        let reader = hound::WavReader::new(std::io::Cursor::new(data.clone())).unwrap();
+        assert_eq!(reader.spec().sample_rate, 24_000);
+        let secs = reader.duration() as f32 / 24_000.0;
+        assert!((secs - 120.0).abs() < 0.1, "duration {secs}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod normalize_tests {
+    use super::normalize_speech;
+
+    fn rms_db(x: &[f32]) -> f32 {
+        let sq: f64 = x.iter().map(|&s| (s as f64) * (s as f64)).sum();
+        10.0 * (sq / x.len() as f64).log10() as f32
+    }
+
+    #[test]
+    fn quiet_speech_is_raised_but_peaks_stay_below_minus_3_db() {
+        // A sine at -27 dB RMS with one louder spike at -9 dB, like the real recording.
+        let mut x: Vec<f32> = (0..24_000 * 5).map(|i| (i as f32 * 0.05).sin() * 0.0632).collect();
+        x[1000] = 0.355;
+        let gain = normalize_speech(&mut x, 24_000);
+        assert!((gain - 6.0).abs() < 0.2, "gain {gain}");
+        assert!(rms_db(&x) > -21.5 && rms_db(&x) < -20.5, "rms {}", rms_db(&x));
+        let peak = x.iter().fold(0f32, |m, &s| m.max(s.abs()));
+        assert!(20.0 * peak.log10() <= -2.99);
+    }
+
+    #[test]
+    fn loud_speech_is_left_alone() {
+        let mut x: Vec<f32> = (0..24_000).map(|i| (i as f32 * 0.05).sin() * 0.2).collect();
+        assert_eq!(normalize_speech(&mut x, 24_000), 0.0);
+    }
+}

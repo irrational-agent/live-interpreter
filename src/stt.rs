@@ -38,7 +38,7 @@ pub async fn connect(
     let url = format!(
         "wss://api.elevenlabs.io/v1/speech-to-text/realtime?model_id=scribe_v3_live\
          &audio_format=pcm_16000&commit_strategy={strategy}&language_code={lang}\
-         &vad_silence_threshold_secs={silence}&no_verbatim=true",
+         &vad_silence_threshold_secs={silence}&no_verbatim=true&filter_background_audio=true",
         lang = opts.language,
         silence = opts.silence_secs,
     );

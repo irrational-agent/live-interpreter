@@ -7,9 +7,19 @@ use serde_json::{Value, json};
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
-const API_VERSION: &str = "2026-10-21";
-const FALLBACK_BETA: &str = "server-side-fallback-2026-07-01";
+pub const API_VERSION: &str = "2026-10-21";
+pub const FALLBACK_BETA: &str = "server-side-fallback-2026-07-01";
 const CONTEXT_SEGMENTS: usize = 3;
+
+/// The Messages API root, honouring `ANTHROPIC_BASE_URL` like the official SDKs do.
+pub fn api_base_url() -> String {
+    std::env::var("ANTHROPIC_BASE_URL")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "https://api.anthropic.com".into())
+        .trim_end_matches('/')
+        .to_string()
+}
 
 pub fn language_name(code: &str) -> &str {
     match code {
@@ -51,12 +61,7 @@ pub struct Translation {
 
 impl Translator {
     pub fn new(http: reqwest::Client, api_key: String, model: String, effort: String, from: &str, to: &str) -> Self {
-        let base_url = std::env::var("ANTHROPIC_BASE_URL")
-            .ok()
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| "https://api.anthropic.com".into())
-            .trim_end_matches('/')
-            .to_string();
+        let base_url = api_base_url();
         let (src, dst) = (language_name(from), language_name(to));
         let system = format!(
             "You are a professional simultaneous interpreter. You receive the speaker's words in {src} \
@@ -277,5 +282,47 @@ impl SentenceSplitter {
     pub fn finish(&mut self) -> Option<String> {
         let rest = std::mem::take(&mut self.buf).trim().to_string();
         (!rest.is_empty()).then_some(rest)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{MarkupFilter, SentenceSplitter};
+
+    fn filter_all(pieces: &[&str]) -> String {
+        let mut f = MarkupFilter::default();
+        let mut out: String = pieces.iter().map(|p| f.push(p)).collect();
+        out.push_str(&f.finish());
+        out
+    }
+
+    #[test]
+    fn drops_leaked_thinking_block() {
+        let leaked = "<thinking>The segment is just a hesitation filler, but there is a word, \"Так\" — rendered as ええと in Japanese.</thinking>ええと、あー…";
+        assert_eq!(filter_all(&[leaked]), "ええと、あー…");
+        // Same text split at awkward points while streaming.
+        let chars: Vec<char> = leaked.chars().collect();
+        let pieces: Vec<String> = chars.chunks(3).map(|c| c.iter().collect()).collect();
+        let refs: Vec<&str> = pieces.iter().map(String::as_str).collect();
+        assert_eq!(filter_all(&refs), "ええと、あー…");
+    }
+
+    #[test]
+    fn keeps_text_and_strips_bare_tags() {
+        assert_eq!(filter_all(&["<segment>こんにちは</segment>"]), "こんにちは");
+        assert_eq!(filter_all(&["今日は", "いい天気", "ですね。"]), "今日はいい天気ですね。");
+        assert_eq!(filter_all(&["<context>Привіт</context>はい。"]), "はい。");
+    }
+
+
+    #[test]
+    fn splits_sentences_while_streaming() {
+        let mut s = SentenceSplitter::default();
+        let mut got = Vec::new();
+        for p in ["こんにちは！今日", "は3.5度です。ま", "た"] {
+            got.extend(s.push(p));
+        }
+        got.extend(s.finish());
+        assert_eq!(got, vec!["こんにちは！", "今日は3.5度です。", "また"]);
     }
 }

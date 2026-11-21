@@ -1,4 +1,4 @@
-//! Microphone capture, speaker playback and sample-rate conversion on top of cpal.
+//! Microphone capture, playback to one or more outputs, and sample-rate conversion on top of cpal.
 
 use anyhow::{Context, Result, anyhow};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -16,45 +16,51 @@ pub fn device_name(device: &cpal::Device) -> String {
         .unwrap_or_else(|_| "<без назви>".into())
 }
 
-pub fn list_devices() -> Result<()> {
+/// Names of the input devices and of the default one.
+pub fn input_names() -> (Vec<String>, Option<String>) {
     let host = cpal::default_host();
-    let default_in = host.default_input_device().map(|d| device_name(&d));
-    let default_out = host.default_output_device().map(|d| device_name(&d));
+    let names = host.input_devices().map(|d| d.map(|d| device_name(&d)).collect()).unwrap_or_default();
+    (names, host.default_input_device().map(|d| device_name(&d)))
+}
 
-    println!("Мікрофони (--input-device):");
-    for d in host.input_devices()? {
-        let name = device_name(&d);
-        let mark = if Some(&name) == default_in.as_ref() { "*" } else { " " };
-        println!("  {mark} {name}");
-    }
-    println!("\nВиходи звуку (--output-device):");
-    for d in host.output_devices()? {
-        let name = device_name(&d);
-        let mark = if Some(&name) == default_out.as_ref() { "*" } else { " " };
-        println!("  {mark} {name}");
-    }
+/// Names of the output devices and of the default one.
+pub fn output_names() -> (Vec<String>, Option<String>) {
+    let host = cpal::default_host();
+    let names = host.output_devices().map(|d| d.map(|d| device_name(&d)).collect()).unwrap_or_default();
+    (names, host.default_output_device().map(|d| device_name(&d)))
+}
+
+pub fn list_devices() -> Result<()> {
+    let print = |title: &str, (names, default): (Vec<String>, Option<String>)| {
+        println!("{title}");
+        for name in names {
+            let mark = if Some(&name) == default.as_ref() { "*" } else { " " };
+            println!("  {mark} {name}");
+        }
+    };
+    print("Мікрофони (--input-device):", input_names());
+    println!();
+    print("Виходи звуку (--output-device, --mic-output):", output_names());
     println!("\n* — пристрій за замовчуванням. Для вибору досить частини назви.");
     Ok(())
 }
 
+/// Finds a device by exact name first, then by a case-insensitive part of the name.
 fn pick_device(wanted: Option<&str>, input: bool) -> Result<cpal::Device> {
     let host = cpal::default_host();
     let kind = if input { "мікрофон" } else { "вихід звуку" };
-    match wanted {
-        None => if input { host.default_input_device() } else { host.default_output_device() }
-            .ok_or_else(|| anyhow!("у системі немає пристрою: {kind}")),
-        Some(w) => {
-            let w = w.to_lowercase();
-            let devices: Vec<cpal::Device> = if input {
-                host.input_devices()?.collect()
-            } else {
-                host.output_devices()?.collect()
-            };
-            devices
-                .into_iter()
-                .find(|d| device_name(d).to_lowercase().contains(&w))
-                .ok_or_else(|| anyhow!("{kind} з «{w}» у назві не знайдено; список: live-interpreter devices"))
-        }
+    let Some(wanted) = wanted else {
+        return if input { host.default_input_device() } else { host.default_output_device() }
+            .ok_or_else(|| anyhow!("у системі немає пристрою: {kind}"));
+    };
+    let devices: Vec<cpal::Device> =
+        if input { host.input_devices()?.collect() } else { host.output_devices()?.collect() };
+    let lower = wanted.to_lowercase();
+    let exact = devices.iter().position(|d| device_name(d) == wanted);
+    let partial = || devices.iter().position(|d| device_name(d).to_lowercase().contains(&lower));
+    match exact.or_else(partial) {
+        Some(i) => Ok(devices.into_iter().nth(i).unwrap()),
+        None => Err(anyhow!("{kind} «{wanted}» не знайдено")),
     }
 }
 
@@ -162,51 +168,72 @@ where
     Ok(stream)
 }
 
-/// Speaker output. Keep the `Player` alive on the main task; hand `PlayerHandle`s to other tasks.
+/// One playback device and the samples waiting for it, at the device's own rate.
+struct Output {
+    queue: Mutex<VecDeque<f32>>,
+    rate: u32,
+    last_play_ms: AtomicU64,
+}
+
+/// Plays the same speech on every output: for example headphones to listen and Voicemeeter's
+/// virtual input to act as a microphone. Keep the `Player` alive on the task that created it
+/// (cpal streams may not move between threads) and hand `PlayerHandle`s to other tasks.
 pub struct Player {
-    _stream: Option<Stream>,
+    _streams: Vec<Stream>,
     handle: PlayerHandle,
-    pub name: String,
+    pub names: Vec<String>,
 }
 
 #[derive(Clone)]
 pub struct PlayerHandle {
-    queue: Arc<Mutex<VecDeque<f32>>>,
-    last_play_ms: Arc<AtomicU64>,
+    outputs: Arc<Vec<Output>>,
     start: Instant,
-    pub rate: u32,
-    muted: bool,
 }
 
+/// Which device to open: `None` means the system default output.
+pub type OutputChoice = Option<String>;
+
 impl Player {
-    pub fn start(wanted: Option<&str>, muted: bool) -> Result<Player> {
-        let queue = Arc::new(Mutex::new(VecDeque::new()));
-        let last_play_ms = Arc::new(AtomicU64::new(0));
+    pub fn start(choices: &[OutputChoice]) -> Result<Player> {
         let start = Instant::now();
-        if muted {
-            let handle = PlayerHandle { queue, last_play_ms, start, rate: 24_000, muted };
-            return Ok(Player { _stream: None, handle, name: "(звук вимкнено)".into() });
+        let mut outputs = Vec::new();
+        let mut devices = Vec::new();
+        let mut names: Vec<String> = Vec::new();
+        for choice in choices {
+            let device = pick_device(choice.as_deref(), false)?;
+            let name = device_name(&device);
+            if names.contains(&name) {
+                continue; // the default output and an explicit choice can be the same device
+            }
+            let supported = device
+                .default_output_config()
+                .with_context(|| format!("не вдалося прочитати формат виходу «{name}»"))?;
+            outputs.push(Output {
+                queue: Mutex::new(VecDeque::new()),
+                rate: supported.config().sample_rate,
+                last_play_ms: AtomicU64::new(0),
+            });
+            devices.push((device, supported));
+            names.push(name);
         }
-        let device = pick_device(wanted, false)?;
-        let name = device_name(&device);
-        let supported = device
-            .default_output_config()
-            .with_context(|| format!("не вдалося прочитати формат виходу «{name}»"))?;
-        let format = supported.sample_format();
-        let config: StreamConfig = supported.config();
-        let channels = config.channels as usize;
-        let rate = config.sample_rate;
-        let (q, lp) = (queue.clone(), last_play_ms.clone());
-        let stream = match format {
-            SampleFormat::F32 => build_output::<f32>(&device, config, channels, q, lp, start)?,
-            SampleFormat::I16 => build_output::<i16>(&device, config, channels, q, lp, start)?,
-            SampleFormat::U16 => build_output::<u16>(&device, config, channels, q, lp, start)?,
-            SampleFormat::I32 => build_output::<i32>(&device, config, channels, q, lp, start)?,
-            other => return Err(anyhow!("вихід звуку хоче непідтримуваний формат {other:?}")),
-        };
-        stream.play().context("не вдалося запустити відтворення")?;
-        let handle = PlayerHandle { queue, last_play_ms, start, rate, muted };
-        Ok(Player { _stream: Some(stream), handle, name })
+        let outputs = Arc::new(outputs);
+        let mut streams = Vec::new();
+        for (index, (device, supported)) in devices.into_iter().enumerate() {
+            let format = supported.sample_format();
+            let config: StreamConfig = supported.config();
+            let channels = config.channels as usize;
+            let (o, name) = (outputs.clone(), &names[index]);
+            let stream = match format {
+                SampleFormat::F32 => build_output::<f32>(&device, config, channels, o, index, start)?,
+                SampleFormat::I16 => build_output::<i16>(&device, config, channels, o, index, start)?,
+                SampleFormat::U16 => build_output::<u16>(&device, config, channels, o, index, start)?,
+                SampleFormat::I32 => build_output::<i32>(&device, config, channels, o, index, start)?,
+                other => return Err(anyhow!("вихід «{name}» хоче непідтримуваний формат {other:?}")),
+            };
+            stream.play().with_context(|| format!("не вдалося запустити відтворення на «{name}»"))?;
+            streams.push(stream);
+        }
+        Ok(Player { _streams: streams, handle: PlayerHandle { outputs, start }, names })
     }
 
     pub fn handle(&self) -> PlayerHandle {
@@ -218,8 +245,8 @@ fn build_output<T>(
     device: &cpal::Device,
     config: StreamConfig,
     channels: usize,
-    queue: Arc<Mutex<VecDeque<f32>>>,
-    last_play_ms: Arc<AtomicU64>,
+    outputs: Arc<Vec<Output>>,
+    index: usize,
     start: Instant,
 ) -> Result<Stream>
 where
@@ -228,7 +255,8 @@ where
     let stream = device.build_output_stream::<T, _, _>(
         config,
         move |data: &mut [T], _| {
-            let mut q = queue.lock().unwrap();
+            let output = &outputs[index];
+            let mut q = output.queue.lock().unwrap();
             let mut played = false;
             for frame in data.chunks_mut(channels) {
                 let s = match q.pop_front() {
@@ -244,7 +272,7 @@ where
                 }
             }
             if played {
-                last_play_ms.store(start.elapsed().as_millis() as u64, Ordering::Relaxed);
+                output.last_play_ms.store(start.elapsed().as_millis() as u64, Ordering::Relaxed);
             }
         },
         |e: cpal::Error| {
@@ -258,24 +286,28 @@ where
 }
 
 impl PlayerHandle {
-    /// Queue mono samples that are already at `self.rate`.
-    pub fn push(&self, samples: &[f32]) {
-        if self.muted {
-            return;
-        }
-        self.queue.lock().unwrap().extend(samples.iter().copied());
+    /// One resampler per output, for a stream of samples at `src_rate`.
+    pub fn resamplers(&self, src_rate: u32) -> Vec<Resampler> {
+        self.outputs.iter().map(|o| Resampler::new(src_rate, o.rate)).collect()
     }
 
-    /// True while audio is queued or was audible within the last `hold`.
+    /// Queues the same mono samples on every output, converting them with `resamplers`.
+    pub fn push(&self, samples: &[f32], resamplers: &mut [Resampler]) {
+        let mut converted = Vec::with_capacity(samples.len() * 2);
+        for (output, resampler) in self.outputs.iter().zip(resamplers.iter_mut()) {
+            converted.clear();
+            resampler.process(samples, &mut converted);
+            output.queue.lock().unwrap().extend(converted.iter().copied());
+        }
+    }
+
+    /// True while audio is queued on any output or was audible within the last `hold`.
     pub fn busy(&self, hold: Duration) -> bool {
-        if self.muted {
-            return false;
-        }
-        if !self.queue.lock().unwrap().is_empty() {
-            return true;
-        }
-        let last = self.last_play_ms.load(Ordering::Relaxed);
-        last != 0 && (self.start.elapsed().as_millis() as u64) < last + hold.as_millis() as u64
+        let now = self.start.elapsed().as_millis() as u64;
+        self.outputs.iter().any(|o| {
+            let last = o.last_play_ms.load(Ordering::Relaxed);
+            !o.queue.lock().unwrap().is_empty() || (last != 0 && now < last + hold.as_millis() as u64)
+        })
     }
 
     pub async fn wait_idle(&self) {

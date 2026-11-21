@@ -1,4 +1,5 @@
-//! ElevenLabs text-to-speech over HTTP streaming, played as the bytes arrive.
+//! ElevenLabs text-to-speech over HTTP streaming, played as the bytes arrive, and the choice
+//! between that and the Eleven v4 Turbo WebSocket.
 
 use crate::audio::{PlayerHandle, Resampler, f32_to_i16};
 use anyhow::{Result, bail};
@@ -31,11 +32,28 @@ pub fn finish_wav(sink: &WavSink) -> Result<()> {
     Ok(())
 }
 
+/// Plays (and optionally saves) an even number of bytes of 24 kHz mono s16le PCM.
+pub fn write_pcm(bytes: &[u8], resamplers: &mut [Resampler], player: &PlayerHandle, save: Option<&WavSink>) -> Result<()> {
+    let samples: Vec<f32> = bytes
+        .chunks_exact(2)
+        .map(|b| i16::from_le_bytes([b[0], b[1]]) as f32 / 32768.0)
+        .collect();
+    if let Some(sink) = save {
+        if let Some(w) = sink.lock().unwrap().as_mut() {
+            for &s in &samples {
+                w.write_sample(f32_to_i16(s))?;
+            }
+        }
+    }
+    player.push(&samples, resamplers);
+    Ok(())
+}
+
 pub struct Tts {
     http: reqwest::Client,
     api_key: String,
-    pub voice_id: String,
-    pub model: String,
+    voice_id: String,
+    model: String,
     language: String,
     previous: Option<String>,
     save: Option<WavSink>,
@@ -81,7 +99,7 @@ impl Tts {
 
         let mut first_audio = None;
         let mut carry: Option<u8> = None;
-        let mut resampler = Resampler::new(TTS_RATE, player.rate);
+        let mut resamplers = player.resamplers(TTS_RATE);
         let mut stream = resp.bytes_stream();
         while let Some(chunk) = stream.next().await {
             let chunk = chunk?;
@@ -95,30 +113,11 @@ impl Tts {
             if bytes.len() % 2 == 1 {
                 carry = bytes.pop();
             }
-            write_pcm(&bytes, &mut resampler, player, self.save.as_ref())?;
+            write_pcm(&bytes, &mut resamplers, player, self.save.as_ref())?;
         }
         self.previous = Some(text.to_string());
         Ok(first_audio.unwrap_or_else(|| started.elapsed()))
     }
-}
-
-/// Plays (and optionally saves) an even number of bytes of 24 kHz mono s16le PCM.
-pub fn write_pcm(bytes: &[u8], resampler: &mut Resampler, player: &PlayerHandle, save: Option<&WavSink>) -> Result<()> {
-    let samples: Vec<f32> = bytes
-        .chunks_exact(2)
-        .map(|b| i16::from_le_bytes([b[0], b[1]]) as f32 / 32768.0)
-        .collect();
-    if let Some(sink) = save {
-        if let Some(w) = sink.lock().unwrap().as_mut() {
-            for &s in &samples {
-                w.write_sample(f32_to_i16(s))?;
-            }
-        }
-    }
-    let mut out = Vec::with_capacity(samples.len() * 2);
-    resampler.process(&samples, &mut out);
-    player.push(&out);
-    Ok(())
 }
 
 /// Picks the transport by model: Eleven v4 Turbo streams over the dialogue WebSocket, every other

@@ -5,7 +5,7 @@
 //! WebSocket handshake, so a background task always keeps the next session open and registered,
 //! pinging it before the server's 20 s inactivity timeout.
 
-use crate::audio::{PlayerHandle, Resampler};
+use crate::audio::PlayerHandle;
 use crate::tts::{TTS_RATE, WavSink, write_pcm};
 use anyhow::{Context, Result, anyhow, bail};
 use base64::Engine as _;
@@ -90,7 +90,7 @@ impl TurboTts {
 
         let mut first_audio = None;
         let mut carry: Option<u8> = None;
-        let mut resampler = Resampler::new(TTS_RATE, player.rate);
+        let mut resamplers = player.resamplers(TTS_RATE);
         while let Some(msg) = ws.next().await {
             let text = match msg {
                 Ok(Message::Text(t)) => t,
@@ -111,7 +111,7 @@ impl TurboTts {
                 if bytes.len() % 2 == 1 {
                     carry = bytes.pop();
                 }
-                write_pcm(&bytes, &mut resampler, player, self.save.as_ref())?;
+                write_pcm(&bytes, &mut resamplers, player, self.save.as_ref())?;
             }
             if v["is_final"].as_bool() == Some(true) {
                 break;
