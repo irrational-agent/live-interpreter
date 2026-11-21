@@ -43,7 +43,8 @@ pub enum Event {
     Partial(String),
     /// A finished phrase; `id` ties the later events to it.
     Segment { id: u64, text: String },
-    Translated { id: u64, text: String, claude: Option<Duration>, model: String },
+    /// `to` is the language of this translation: the target can change while the engine runs.
+    Translated { id: u64, text: String, to: String, claude: Option<Duration>, model: String },
     Furigana { id: u64, parts: Vec<Ruby> },
     /// Speech for the phrase started this long after the phrase was finished.
     Spoken { id: u64, after: Duration },
@@ -60,6 +61,9 @@ pub struct Config {
     pub save_output: Option<PathBuf>,
     /// Play nothing (for tests).
     pub mute: bool,
+    /// Lets the window change the target language while the engine runs; the next phrase
+    /// is translated into the new language without reconnecting anything.
+    pub target: Option<watch::Receiver<String>>,
 }
 
 /// The outputs the settings ask for, in order: listening output first, then the virtual mic.
@@ -102,6 +106,7 @@ pub fn is_filler_only(text: &str) -> bool {
 struct Utterance {
     id: u64,
     text: String,
+    language: String,
     committed_at: Instant,
     first_of_segment: bool,
 }
@@ -162,12 +167,18 @@ pub async fn run(cfg: Config, keys: Keys, emit: Emit, mut stop: watch::Receiver<
     } else {
         None
     };
-    let furigana = (s.furigana && s.to == "ja").then(|| Furigana::new(http.clone(), anthropic.clone(), s.model.clone()));
+    let furigana = s.furigana.then(|| Furigana::new(http.clone(), anthropic.clone(), s.model.clone()));
 
     let (seg_tx, seg_rx) = mpsc::unbounded_channel::<(u64, String, Instant)>();
     let (say_tx, say_rx) = mpsc::unbounded_channel::<Utterance>();
     let translator = translate::Translator::new(http.clone(), anthropic, s.model.clone(), s.effort.clone(), &s.from, &s.to);
-    let extras = Extras { emit: emit.clone(), furigana, chatbox: chatbox.clone(), chatbox_original: s.vrchat_original };
+    let extras = Extras {
+        emit: emit.clone(),
+        furigana,
+        chatbox: chatbox.clone(),
+        chatbox_original: s.vrchat_original,
+        target: cfg.target.clone(),
+    };
     let translate_task = tokio::spawn(translate_loop(translator, seg_rx, say_tx, extras));
     let speaker = tts::Speaker::new(http, keys.eleven.clone(), voice.id.clone(), s.tts_model.clone(), s.to.clone(), save.clone());
     let speak_task = tokio::spawn(speak_loop(speaker, say_rx, player.handle(), emit.clone()));
@@ -261,6 +272,7 @@ struct Extras {
     furigana: Option<Furigana>,
     chatbox: Option<mpsc::UnboundedSender<ChatboxMessage>>,
     chatbox_original: bool,
+    target: Option<watch::Receiver<String>>,
 }
 
 async fn translate_loop(
@@ -269,51 +281,69 @@ async fn translate_loop(
     say: mpsc::UnboundedSender<Utterance>,
     extras: Extras,
 ) {
-    fn send(say: &mpsc::UnboundedSender<Utterance>, id: u64, text: String, at: Instant, first: &mut bool) {
-        let _ = say.send(Utterance { id, text, committed_at: at, first_of_segment: *first });
+    fn send(say: &mpsc::UnboundedSender<Utterance>, id: u64, text: String, language: &str, at: Instant, first: &mut bool) {
+        let _ = say.send(Utterance { id, text, language: language.to_string(), committed_at: at, first_of_segment: *first });
         *first = false;
     }
+    let mut readings = tokio::task::JoinSet::new();
     while let Some((id, segment, committed_at)) = segments.recv().await {
+        if let Some(target) = &extras.target {
+            let to = target.borrow().clone();
+            tr.set_target(&to);
+        }
+        let language = tr.target().to_string();
         let mut splitter = translate::SentenceSplitter::default();
         let mut first = true;
         // Each finished sentence goes to speech while Claude is still writing the next one.
         let result = tr
             .translate(&segment, |piece| {
                 for sentence in splitter.push(piece) {
-                    send(&say, id, sentence, committed_at, &mut first);
+                    send(&say, id, sentence, &language, committed_at, &mut first);
                 }
             })
             .await;
         match result {
             Ok(t) => {
                 if let Some(rest) = splitter.finish() {
-                    send(&say, id, rest, committed_at, &mut first);
+                    send(&say, id, rest, &language, committed_at, &mut first);
                 }
                 if t.text.is_empty() {
                     continue;
                 }
-                (extras.emit)(Event::Translated { id, text: t.text.clone(), claude: t.first_token, model: t.model });
+                (extras.emit)(Event::Translated {
+                    id,
+                    text: t.text.clone(),
+                    to: language.clone(),
+                    claude: t.first_token,
+                    model: t.model,
+                });
                 if let Some(chatbox) = &extras.chatbox {
                     let text = if extras.chatbox_original { format!("{segment}\n{}", t.text) } else { t.text.clone() };
                     let _ = chatbox.send(ChatboxMessage::Text(text));
                 }
-                if let Some(furigana) = extras.furigana.clone().filter(|_| ruby::has_kanji(&t.text)) {
+                let wants_readings = ruby::supports(&language) && ruby::has_kanji(&t.text);
+                if let Some(furigana) = extras.furigana.clone().filter(|_| wants_readings) {
                     let emit = extras.emit.clone();
-                    tokio::spawn(async move {
-                        match furigana.annotate(&t.text).await {
+                    let language = language.clone();
+                    readings.spawn(async move {
+                        match furigana.annotate(&t.text, &language).await {
                             Ok(parts) => emit(Event::Furigana { id, parts }),
-                            Err(e) => eprintln!("фуріґана: {e:#}"),
+                            Err(e) => eprintln!("читання: {e:#}"),
                         }
                     });
                 }
             }
             Err(e) => (extras.emit)(Event::Problem(format!("переклад не вдався: {e:#}"))),
         }
+        while readings.try_join_next().is_some() {}
     }
+    // The input ended: let the readings of the last phrases arrive before the engine shuts down.
+    let _ = tokio::time::timeout(Duration::from_secs(8), async { while readings.join_next().await.is_some() {} }).await;
 }
 
 async fn speak_loop(mut speaker: tts::Speaker, mut said: mpsc::UnboundedReceiver<Utterance>, player: PlayerHandle, emit: Emit) {
     while let Some(u) = said.recv().await {
+        speaker.set_language(&u.language);
         match speaker.speak(&u.text, &player).await {
             Ok(_) if u.first_of_segment => emit(Event::Spoken { id: u.id, after: u.committed_at.elapsed() }),
             Ok(_) => {}

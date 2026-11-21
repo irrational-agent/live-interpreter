@@ -149,4 +149,14 @@ impl Speaker {
             Speaker::Turbo(t) => t.speak(text, player).await,
         }
     }
+
+    /// The HTTP models take a language hint; Eleven v4 Turbo reads the language from the text.
+    pub fn set_language(&mut self, language: &str) {
+        if let Speaker::Http(t) = self {
+            if t.language != language {
+                t.language = language.to_string();
+                t.previous = None;
+            }
+        }
+    }
 }

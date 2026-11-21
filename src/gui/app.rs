@@ -64,6 +64,8 @@ struct Entry {
     id: u64,
     original: String,
     translation: Option<String>,
+    /// Language of `translation`; the target can change while listening.
+    lang: String,
     ruby: Option<Vec<Ruby>>,
     claude: Option<Duration>,
     spoken: Option<Duration>,
@@ -77,6 +79,8 @@ enum Status {
 
 struct Running {
     stop: tokio::sync::watch::Sender<bool>,
+    /// Sends a new target language to the running engine.
+    target: tokio::sync::watch::Sender<String>,
     settings: Settings,
 }
 
@@ -110,6 +114,8 @@ pub struct App {
     selftest: Option<SelfTest>,
     /// Stop was pressed by "restart": start again once the engine has stopped.
     restart_pending: bool,
+    /// The self-test has already switched the target language.
+    switched: bool,
 }
 
 fn window_handle(cc: &eframe::CreationContext<'_>) -> isize {
@@ -151,6 +157,7 @@ impl App {
             ctx: cc.egui_ctx.clone(),
             selftest,
             restart_pending: false,
+            switched: false,
         };
         app.load_voices();
         app
@@ -195,7 +202,10 @@ impl App {
             mute: test_input.is_some(),
             input_file: test_input,
             save_output: None,
+            target: None,
         };
+        let (target, target_rx) = tokio::sync::watch::channel(self.settings.to.clone());
+        let cfg = engine::Config { target: Some(target_rx), ..cfg };
         let (stop, stop_rx) = tokio::sync::watch::channel(false);
         let (tx, ctx) = (self.tx.clone(), self.ctx.clone());
         let (emit_tx, emit_ctx) = (tx.clone(), ctx.clone());
@@ -212,7 +222,7 @@ impl App {
             let _ = tx.send(Msg::Stopped(result.err().map(|e| format!("{e:#}"))));
             ctx.request_repaint();
         });
-        self.running = Some(Running { stop, settings: self.settings.clone() });
+        self.running = Some(Running { stop, target, settings: self.settings.clone() });
         self.status = Status::Starting;
         self.error = None;
         self.partial.clear();
@@ -235,14 +245,23 @@ impl App {
                 Msg::Engine(Event::Partial(text)) => self.partial = text,
                 Msg::Engine(Event::Segment { id, text }) => {
                     self.partial.clear();
-                    self.entries.push(Entry { id, original: text, translation: None, ruby: None, claude: None, spoken: None });
+                    self.entries.push(Entry {
+                        id,
+                        original: text,
+                        translation: None,
+                        lang: String::new(),
+                        ruby: None,
+                        claude: None,
+                        spoken: None,
+                    });
                     if self.entries.len() > MAX_ENTRIES {
                         self.entries.remove(0);
                     }
                 }
-                Msg::Engine(Event::Translated { id, text, claude, .. }) => {
+                Msg::Engine(Event::Translated { id, text, to, claude, .. }) => {
                     if let Some(entry) = self.entry(id) {
                         entry.translation = Some(text);
+                        entry.lang = to;
                         entry.claude = claude;
                     }
                 }
@@ -273,6 +292,20 @@ impl App {
             }
         }
         self.problems.retain(|(_, at)| now - at < PROBLEM_SECONDS);
+    }
+
+    /// LIVE_INTERPRETER_SWITCH_AT / _SWITCH_LANG: change the target mid-run, as the pills do.
+    fn switch_for_selftest(&mut self, now: f64) {
+        if self.selftest.is_none() {
+            return;
+        }
+        let at = std::env::var("LIVE_INTERPRETER_SWITCH_AT").ok().and_then(|v| v.parse::<f64>().ok());
+        if let (Some(at), Ok(lang)) = (at, std::env::var("LIVE_INTERPRETER_SWITCH_LANG")) {
+            if now > at && self.settings.to != lang && !self.switched {
+                self.switched = true;
+                self.settings.to = lang;
+            }
+        }
     }
 
     fn drive_selftest(&mut self, now: f64) {
@@ -306,6 +339,43 @@ impl App {
             });
         }
         self.ctx.request_repaint_after(Duration::from_millis(250));
+    }
+
+    /// Pills for the target language, drawn right to left. Japanese and Chinese are always there;
+    /// another language chosen in the settings gets its own pill.
+    fn target_switch(&mut self, ui: &mut egui::Ui) {
+        let mut targets = vec![("zh", "中文"), ("ja", "日本語")];
+        if !targets.iter().any(|(c, _)| *c == self.settings.to) {
+            targets.insert(0, (self.settings.to.as_str(), language_name(&self.settings.to)));
+        }
+        let targets: Vec<(String, String)> = targets.into_iter().map(|(c, n)| (c.to_string(), n.to_string())).collect();
+        for (code, name) in targets {
+            let selected = self.settings.to == code;
+            let hint = format!("Перекладати на {}", language_name(&code));
+            if widgets::pill(ui, &name, selected).on_hover_text(hint).clicked() && !selected {
+                self.settings.to = code;
+                self.save_settings();
+            }
+        }
+    }
+
+    fn save_settings(&mut self) {
+        if self.persist {
+            if let Err(e) = self.settings.save() {
+                self.error = Some(format!("налаштування не збереглися: {e:#}"));
+            }
+        }
+    }
+
+    /// A new target language reaches the running engine at once: the next phrase is translated
+    /// into it, without stopping to listen.
+    fn push_target(&mut self) {
+        if let Some(running) = &mut self.running {
+            if running.settings.to != self.settings.to {
+                running.settings.to = self.settings.to.clone();
+                let _ = running.target.send(self.settings.to.clone());
+            }
+        }
     }
 
     fn voice_label(&self) -> String {
@@ -350,6 +420,8 @@ impl App {
                     self.show_settings = !self.show_settings;
                 }
                 ui.add_space(4.0);
+                self.target_switch(ui);
+                ui.add_space(8.0);
                 match self.status {
                     Status::Idle => {
                         if widgets::primary_button(ui, "Почати слухати", true, true).clicked() {
@@ -407,14 +479,15 @@ impl App {
             widgets::centered_note(ui, &title, &body);
             return;
         }
-        let japanese = self.running.as_ref().map_or(&self.settings, |r| &r.settings).to == "ja";
-        let style = furigana::TextStyle {
-            base: FontId::new(25.0, FontFamily::Name(fonts::JAPANESE_DISPLAY.into())),
-            ruby: FontId::proportional(12.0),
+        let style_for = |family: &str, ruby_size: f32| furigana::TextStyle {
+            base: FontId::new(25.0, FontFamily::Name(family.into())),
+            ruby: FontId::proportional(ruby_size),
             base_color: theme::TEXT,
             ruby_color: theme::RUBY,
             row_gap: 4.0,
         };
+        let japanese = style_for(fonts::JAPANESE_DISPLAY, 12.0);
+        let chinese = style_for(fonts::CHINESE_DISPLAY, 10.5);
         egui::ScrollArea::vertical().stick_to_bottom(true).auto_shrink([false, false]).show(ui, |ui| {
             ui.add_space(4.0);
             for entry in &self.entries {
@@ -423,9 +496,10 @@ impl App {
                     ui.label(RichText::new(&entry.original).size(14.5).color(theme::TEXT_MUTED));
                     ui.add_space(4.0);
                     match &entry.translation {
-                        Some(text) if japanese => {
+                        Some(text) if entry.lang == "ja" || entry.lang == "zh" => {
                             let parts = entry.ruby.clone().unwrap_or_else(|| ruby::plain_parts(text));
-                            furigana::show(ui, &parts, &style);
+                            let style = if entry.lang == "zh" { &chinese } else { &japanese };
+                            furigana::show(ui, &parts, style);
                         }
                         Some(text) => {
                             ui.label(RichText::new(text).size(22.0).color(theme::TEXT));
@@ -529,18 +603,17 @@ impl App {
             let models: Vec<(String, String)> = CLAUDE_MODELS.iter().map(|(c, n)| (c.to_string(), n.to_string())).collect();
             combo(ui, "Модель Claude", width, &mut self.settings.model, &models);
             ui.add_space(4.0);
-            if self.settings.to == "ja" {
-                widgets::toggle(ui, &mut self.settings.furigana, "Показувати фуріґану над кандзі");
+            if ruby::supports(&self.settings.to) {
+                widgets::toggle(ui, &mut self.settings.furigana, "Показувати читання над ієрогліфами");
+                widgets::hint(ui, "Фуріґана над кандзі для японської, піньїнь над ієрогліфами для китайської.");
             }
             ui.label(RichText::new("Пауза, після якої фраза закінчена").size(12.5).color(theme::TEXT_MUTED));
             ui.add(egui::Slider::new(&mut self.settings.silence, 0.3..=2.0).step_by(0.1).suffix(" с"));
             ui.add_space(16.0);
         });
 
-        if self.settings != before && self.persist {
-            if let Err(e) = self.settings.save() {
-                self.error = Some(format!("налаштування не збереглися: {e:#}"));
-            }
+        if self.settings != before {
+            self.save_settings();
         }
     }
 
@@ -628,6 +701,8 @@ impl eframe::App for App {
         let now = ui.input(|i| i.time);
         self.receive(now);
         self.drive_selftest(now);
+        self.push_target();
+        self.switch_for_selftest(now);
         if self.restart_pending && self.running.is_none() {
             self.restart_pending = false;
             self.start();

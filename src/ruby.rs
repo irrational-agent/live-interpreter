@@ -1,4 +1,5 @@
-//! Furigana for Japanese translations. A second Claude request marks the readings of the kanji in
+//! Readings over the characters of a translation: furigana for Japanese, pinyin for Chinese.
+//! A second Claude request marks the readings of the kanji or hanzi in
 //! text that has already gone to the voice, so it never delays speech. The answer is accepted only
 //! if, without its markup, it is exactly the translation; otherwise the text is shown without
 //! readings rather than altered.
@@ -66,11 +67,14 @@ pub fn joined(parts: &[Ruby]) -> String {
     parts.iter().map(|p| p.text.as_str()).collect()
 }
 
-const SYSTEM: &str = "You add furigana to Japanese text. Copy the text exactly, character for character, \
-and wrap every run of kanji in {kanji|reading}, where the reading is hiragana that fits this context. \
-Keep okurigana and kana outside the braces, for example {食|た}べる, {日本語|にほんご}, {今日|きょう}は, \
-{一人|ひとり}. Do not add, remove or change any other character, and do not translate. \
-Reply with the marked text only. Do not include internal or system XML tags in your response.";
+const JAPANESE: &str = "You add furigana to Japanese text. Copy the text exactly, character for character, and wrap every run of kanji in {kanji|reading}, where the reading is hiragana that fits this context. Keep okurigana and kana outside the braces, for example {食|た}べる, {日本語|にほんご}, {今日|きょう}は, {一人|ひとり}. Do not add, remove or change any other character, and do not translate. Reply with the marked text only. Do not include internal or system XML tags in your response.";
+
+const CHINESE: &str = "You add pinyin to Chinese text. Copy the text exactly, character for character, and wrap every Chinese character in {character|pinyin}, one character per pair. Write the pinyin in lowercase with tone marks, as the character is pronounced in this sentence (tone changes of 一 and 不 included, neutral tone without a mark), for example {你|nǐ}{好|hǎo}, {不|bú}{是|shì}, {我|wǒ}{的|de}. Keep punctuation, digits and Latin letters outside the braces. Do not add, remove or change any other character, and do not translate. Reply with the marked text only. Do not include internal or system XML tags in your response.";
+
+/// Languages that get readings over their characters: furigana for Japanese, pinyin for Chinese.
+pub fn supports(language: &str) -> bool {
+    matches!(language, "ja" | "zh")
+}
 
 #[derive(Clone)]
 pub struct Furigana {
@@ -85,14 +89,16 @@ impl Furigana {
         Self { http, api_key, base_url: api_base_url(), model }
     }
 
-    pub async fn annotate(&self, japanese: &str) -> Result<Vec<Ruby>> {
+    /// Marks the readings of `text` in `language`: "ja" gets furigana, "zh" gets pinyin.
+    pub async fn annotate(&self, text: &str, language: &str) -> Result<Vec<Ruby>> {
+        let system = if language == "zh" { CHINESE } else { JAPANESE };
         let body = json!({
             "model": self.model,
             "max_tokens": 16000,
             "output_config": { "effort": "low" },
             "fallbacks": "default",
-            "system": SYSTEM,
-            "messages": [{ "role": "user", "content": japanese }],
+            "system": system,
+            "messages": [{ "role": "user", "content": text }],
         });
         let resp = self
             .http
@@ -104,13 +110,13 @@ impl Furigana {
             .send()
             .await?;
         let status = resp.status();
-        let text = resp.text().await?;
+        let body = resp.text().await?;
         if !status.is_success() {
-            bail!("Claude API {status}: {text}");
+            bail!("Claude API {status}: {body}");
         }
-        let v: Value = serde_json::from_str(&text)?;
+        let v: Value = serde_json::from_str(&body)?;
         if v["stop_reason"] == "refusal" {
-            bail!("Claude відмовився розставити фуріґану");
+            bail!("Claude відмовився розставити читання");
         }
         let answer: String = v["content"]
             .as_array()
@@ -121,8 +127,8 @@ impl Furigana {
             .collect();
         let parts = parse_ruby(answer.trim());
         let squash = |s: &str| s.chars().filter(|c| !c.is_whitespace()).collect::<String>();
-        if squash(&joined(&parts)) != squash(japanese) {
-            bail!("фуріґана змінила текст, тож її не показую");
+        if squash(&joined(&parts)) != squash(text) {
+            bail!("розмітка читань змінила текст, тож її не показую");
         }
         Ok(parts)
     }

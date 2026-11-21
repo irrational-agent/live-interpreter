@@ -311,6 +311,12 @@ async fn run(a: RunArgs) -> Result<()> {
             let _ = stop_tx.send(true);
         }
     });
-    let cfg = engine::Config { settings, input_file: a.input_file, save_output: a.voice.save_output, mute: a.voice.mute };
+    let cfg = engine::Config {
+        settings,
+        input_file: a.input_file,
+        save_output: a.voice.save_output,
+        mute: a.voice.mute,
+        target: None,
+    };
     engine::run(cfg, keys, emit, stop_rx).await
 }

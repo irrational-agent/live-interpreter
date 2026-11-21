@@ -5,6 +5,8 @@ const MEIRYO_BASELINE_SHIFT: f32 = 0.1;
 
 pub const SEMIBOLD: &str = "semibold";
 pub const JAPANESE_DISPLAY: &str = "japanese-display";
+/// Simplified Chinese: Japanese fonts lack many simplified hanzi and draw shared ones the Japanese way.
+pub const CHINESE_DISPLAY: &str = "chinese-display";
 
 /// egui's built-in fonts have no kanji, so Japanese comes from the fonts shipped with Windows.
 const FACES: &[(&str, &str)] = &[
@@ -14,11 +16,14 @@ const FACES: &[(&str, &str)] = &[
     ("yu-gothic", r"C:\Windows\Fonts\YuGothM.ttc"),
     ("yu-mincho", r"C:\Windows\Fonts\yumindb.ttf"),
     ("ms-gothic", r"C:\Windows\Fonts\msgothic.ttc"),
+    ("yahei", r"C:\Windows\Fonts\msyh.ttc"),
+    ("simsun", r"C:\Windows\Fonts\simsun.ttc"),
 ];
 
 const BODY_STACK: &[&str] = &["segoe", "meiryo", "yu-gothic", "ms-gothic"];
 const SEMIBOLD_STACK: &[&str] = &["segoe-semibold", "segoe", "meiryo", "yu-gothic", "ms-gothic"];
-const DISPLAY_STACK: &[&str] = &["yu-mincho", "meiryo", "yu-gothic", "ms-gothic", "segoe"];
+const DISPLAY_STACK: &[&str] = &["yu-mincho", "meiryo", "yu-gothic", "ms-gothic", "yahei", "segoe"];
+const CHINESE_STACK: &[&str] = &["yahei", "simsun", "meiryo", "segoe"];
 
 pub fn install(ctx: &egui::Context) {
     let mut fonts = FontDefinitions::default();
@@ -51,6 +56,7 @@ pub fn install(ctx: &egui::Context) {
         (FontFamily::Monospace, stack(BODY_STACK)),
         (FontFamily::Name(SEMIBOLD.into()), stack(SEMIBOLD_STACK)),
         (FontFamily::Name(JAPANESE_DISPLAY.into()), stack(DISPLAY_STACK)),
+        (FontFamily::Name(CHINESE_DISPLAY.into()), stack(CHINESE_STACK)),
     ];
     fonts.families.extend(families);
     ctx.set_fonts(fonts);

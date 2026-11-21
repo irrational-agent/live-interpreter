@@ -40,6 +40,26 @@ pub fn primary_button(ui: &mut Ui, title: &str, primary: bool, enabled: bool) ->
     if enabled { response.on_hover_cursor(CursorIcon::PointingHand) } else { response }
 }
 
+/// A small rounded choice; the selected one is filled with the accent.
+pub fn pill(ui: &mut Ui, label: &str, selected: bool) -> Response {
+    let galley = ui.painter().layout_no_wrap(label.to_owned(), FontId::proportional(14.0), egui::Color32::PLACEHOLDER);
+    let size = vec2(galley.size().x + 26.0, 32.0);
+    let (rect, response) = ui.allocate_exact_size(size, Sense::click());
+    let hover = ui.ctx().animate_bool_with_time(response.id, response.hovered(), HOVER_FADE_SECONDS);
+    let (fill, text) = if selected {
+        (theme::accent_soft(), theme::ACCENT_TEXT)
+    } else {
+        (theme::mix(theme::BG, theme::RAISED, hover), theme::TEXT_MUTED)
+    };
+    let painter = ui.painter();
+    painter.rect_filled(rect, CornerRadius::same(16), fill);
+    if selected {
+        painter.rect_stroke(rect, CornerRadius::same(16), Stroke::new(1.0, theme::ACCENT), egui::StrokeKind::Inside);
+    }
+    painter.galley(rect.center() - galley.size() / 2.0, galley, text);
+    response.on_hover_cursor(CursorIcon::PointingHand)
+}
+
 #[derive(Clone, Copy)]
 pub enum Icon {
     Gear,

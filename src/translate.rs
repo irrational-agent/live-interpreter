@@ -50,6 +50,8 @@ pub struct Translator {
     pub model: String,
     effort: String,
     system: String,
+    from: String,
+    to: String,
     history: VecDeque<String>,
 }
 
@@ -59,11 +61,10 @@ pub struct Translation {
     pub model: String,
 }
 
-impl Translator {
-    pub fn new(http: reqwest::Client, api_key: String, model: String, effort: String, from: &str, to: &str) -> Self {
-        let base_url = api_base_url();
+/// The interpreter's instructions for one language pair.
+fn system_prompt(from: &str, to: &str) -> String {
         let (src, dst) = (language_name(from), language_name(to));
-        let system = format!(
+        format!(
             "You are a professional simultaneous interpreter. You receive the speaker's words in {src} \
              from live speech recognition, one short segment at a time, and you translate each segment \
              into natural spoken {dst}.\n\
@@ -78,8 +79,28 @@ impl Translator {
              - Keep the speaker's tone and register. Translate names and numbers faithfully.\n\
              - Render hesitations and filler sounds with a short natural {dst} filler, or leave them out. \
                Never comment on them."
-        );
-        Self { http, api_key, base_url, model, effort, system, history: VecDeque::new() }
+        )
+}
+
+impl Translator {
+    pub fn new(http: reqwest::Client, api_key: String, model: String, effort: String, from: &str, to: &str) -> Self {
+        let system = system_prompt(from, to);
+        let (from, to) = (from.to_string(), to.to_string());
+        Self { http, api_key, base_url: api_base_url(), model, effort, system, from, to, history: VecDeque::new() }
+    }
+
+    /// Language the translator currently translates into.
+    pub fn target(&self) -> &str {
+        &self.to
+    }
+
+    /// Switches the target language between segments. The earlier segments stay as context: they
+    /// are in the speaker's language, which does not change.
+    pub fn set_target(&mut self, to: &str) {
+        if to != self.to {
+            self.to = to.to_string();
+            self.system = system_prompt(&self.from, to);
+        }
     }
 
     /// Translates one segment, calling `on_delta` with each text fragment as it streams in.

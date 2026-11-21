@@ -117,22 +117,29 @@ fn measure_row(cells: Vec<Cell>, style: &TextStyle, ruby_height: f32) -> Row {
     Row { cells, ruby_height, baseline, height }
 }
 
-/// Lets a reading that is wider than its kanji hang over neighbouring kana by up to half a ruby
-/// character on each side, as Japanese typesetting does, instead of spreading the kanji apart.
-/// Only over plain neighbours, so two readings never collide.
+/// Lets a reading that is wider than its character hang over its neighbours instead of spreading
+/// the characters apart, as Japanese and Chinese typesetting do: up to half a ruby character on
+/// each side, and only into room the neighbour's own reading leaves free, so readings never collide.
 fn allow_overhang(cells: &mut [Cell], style: &TextStyle) {
     let per_side = style.ruby.size * 0.5;
-    let has_ruby: Vec<bool> = cells.iter().map(|c| c.part.ruby.is_some()).collect();
-    for (i, cell) in cells.iter_mut().enumerate() {
-        let Some(ruby) = &cell.part.ruby else { continue };
-        let base = cell.part.base.size().x;
+    // Free room above each cell, on each of its sides.
+    let spare: Vec<f32> = cells
+        .iter()
+        .map(|c| match &c.part.ruby {
+            Some(ruby) => ((c.part.base.size().x - ruby.size().x - PART_GAP * 2.0) / 2.0).clamp(0.0, per_side),
+            None => per_side,
+        })
+        .collect();
+    for i in 0..cells.len() {
+        let Some(ruby) = &cells[i].part.ruby else { continue };
+        let base = cells[i].part.base.size().x;
         let excess = ruby.size().x + PART_GAP * 2.0 - base;
         if excess <= 0.0 {
             continue;
         }
-        let left = if i > 0 && !has_ruby[i - 1] { per_side } else { 0.0 };
-        let right = if i + 1 < has_ruby.len() && !has_ruby[i + 1] { per_side } else { 0.0 };
-        cell.part.width = base + (excess - left - right).max(0.0);
+        let left = if i > 0 { spare[i - 1] } else { 0.0 };
+        let right = if i + 1 < cells.len() { spare[i + 1] } else { 0.0 };
+        cells[i].part.width = base + (excess - left - right).max(0.0);
     }
 }
 
