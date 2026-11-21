@@ -82,7 +82,6 @@ impl Tts {
         let mut first_audio = None;
         let mut carry: Option<u8> = None;
         let mut resampler = Resampler::new(TTS_RATE, player.rate);
-        let mut out = Vec::new();
         let mut stream = resp.bytes_stream();
         while let Some(chunk) = stream.next().await {
             let chunk = chunk?;
@@ -96,22 +95,59 @@ impl Tts {
             if bytes.len() % 2 == 1 {
                 carry = bytes.pop();
             }
-            let samples: Vec<f32> = bytes
-                .chunks_exact(2)
-                .map(|b| i16::from_le_bytes([b[0], b[1]]) as f32 / 32768.0)
-                .collect();
-            if let Some(sink) = &self.save {
-                if let Some(w) = sink.lock().unwrap().as_mut() {
-                    for &s in &samples {
-                        w.write_sample(f32_to_i16(s))?;
-                    }
-                }
-            }
-            out.clear();
-            resampler.process(&samples, &mut out);
-            player.push(&out);
+            write_pcm(&bytes, &mut resampler, player, self.save.as_ref())?;
         }
         self.previous = Some(text.to_string());
         Ok(first_audio.unwrap_or_else(|| started.elapsed()))
+    }
+}
+
+/// Plays (and optionally saves) an even number of bytes of 24 kHz mono s16le PCM.
+pub fn write_pcm(bytes: &[u8], resampler: &mut Resampler, player: &PlayerHandle, save: Option<&WavSink>) -> Result<()> {
+    let samples: Vec<f32> = bytes
+        .chunks_exact(2)
+        .map(|b| i16::from_le_bytes([b[0], b[1]]) as f32 / 32768.0)
+        .collect();
+    if let Some(sink) = save {
+        if let Some(w) = sink.lock().unwrap().as_mut() {
+            for &s in &samples {
+                w.write_sample(f32_to_i16(s))?;
+            }
+        }
+    }
+    let mut out = Vec::with_capacity(samples.len() * 2);
+    resampler.process(&samples, &mut out);
+    player.push(&out);
+    Ok(())
+}
+
+/// Picks the transport by model: Eleven v4 Turbo streams over the dialogue WebSocket, every other
+/// model over HTTP streaming.
+pub enum Speaker {
+    Http(Tts),
+    Turbo(crate::tts_ws::TurboTts),
+}
+
+impl Speaker {
+    pub fn new(
+        http: reqwest::Client,
+        api_key: String,
+        voice_id: String,
+        model: String,
+        language: String,
+        save: Option<WavSink>,
+    ) -> Self {
+        if model == "eleven_v4_turbo" {
+            Speaker::Turbo(crate::tts_ws::TurboTts::new(api_key, voice_id, model, save))
+        } else {
+            Speaker::Http(Tts::new(http, api_key, voice_id, model, language, save))
+        }
+    }
+
+    pub async fn speak(&mut self, text: &str, player: &PlayerHandle) -> Result<Duration> {
+        match self {
+            Speaker::Http(t) => t.speak(text, player).await,
+            Speaker::Turbo(t) => t.speak(text, player).await,
+        }
     }
 }

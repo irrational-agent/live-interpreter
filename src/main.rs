@@ -6,6 +6,7 @@ mod audio;
 mod stt;
 mod translate;
 mod tts;
+mod tts_ws;
 mod voices;
 
 use anyhow::{Context, Result, anyhow};
@@ -59,8 +60,9 @@ struct VoiceArgs {
     /// Голос: назва з акаунта (зокрема твій клон) або voice_id
     #[arg(long, default_value = "George")]
     voice: String,
-    /// Модель озвучення: eleven_flash_v2_5 (найшвидша) або eleven_v4 (найякісніша)
-    #[arg(long, default_value = "eleven_flash_v2_5")]
+    /// Модель озвучення: eleven_v4_turbo (якісна й швидка, добре передає клон),
+    /// eleven_flash_v2_5 (найдешевша й найшвидша) або eleven_v4 (найякісніша, повільна)
+    #[arg(long, default_value = "eleven_v4_turbo")]
     tts_model: String,
     /// Пристрій виходу звуку (частина назви)
     #[arg(long)]
@@ -261,7 +263,7 @@ async fn say(a: SayArgs) -> Result<()> {
         println!("{} ◂ {}   [Claude {}]", a.lang.to, t.text, t.first_token.map(secs).unwrap_or_default());
         (t.text, a.lang.to.clone())
     };
-    let mut speaker = tts::Tts::new(http, keys.eleven, voice.id.clone(), a.voice.tts_model.clone(), lang, save.clone());
+    let mut speaker = tts::Speaker::new(http, keys.eleven, voice.id.clone(), a.voice.tts_model.clone(), lang, save.clone());
     let first = speaker.speak(&text, &player.handle()).await?;
     println!("голос «{}», {} · звук пішов через {}", voice.name, a.voice.tts_model, secs(first));
     player.handle().wait_idle().await;
@@ -339,7 +341,7 @@ async fn run(a: RunArgs) -> Result<()> {
     let (say_tx, say_rx) = mpsc::unbounded_channel::<Utterance>();
     let translator = translate::Translator::new(http.clone(), anthropic, a.lang.model.clone(), a.lang.effort.clone(), &a.lang.from, &a.lang.to);
     let translate_task = tokio::spawn(translate_loop(translator, seg_rx, say_tx, a.lang.to.clone()));
-    let speaker = tts::Tts::new(http, keys.eleven.clone(), voice.id.clone(), a.voice.tts_model.clone(), a.lang.to.clone(), save.clone());
+    let speaker = tts::Speaker::new(http, keys.eleven.clone(), voice.id.clone(), a.voice.tts_model.clone(), a.lang.to.clone(), save.clone());
     let speak_task = tokio::spawn(speak_loop(speaker, say_rx, player.handle()));
 
     let ctrl_c = tokio::signal::ctrl_c();
@@ -468,7 +470,7 @@ async fn translate_loop(
     }
 }
 
-async fn speak_loop(mut speaker: tts::Tts, mut said: mpsc::UnboundedReceiver<Utterance>, player: PlayerHandle) {
+async fn speak_loop(mut speaker: tts::Speaker, mut said: mpsc::UnboundedReceiver<Utterance>, player: PlayerHandle) {
     while let Some(u) = said.recv().await {
         match speaker.speak(&u.text, &player).await {
             Ok(_) if u.first_of_segment => {
@@ -557,5 +559,33 @@ mod upload_tests {
         let secs = reader.duration() as f32 / 24_000.0;
         assert!((secs - 120.0).abs() < 0.1, "duration {secs}");
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod normalize_tests {
+    use crate::voices::normalize_speech;
+
+    fn rms_db(x: &[f32]) -> f32 {
+        let sq: f64 = x.iter().map(|&s| (s as f64) * (s as f64)).sum();
+        10.0 * (sq / x.len() as f64).log10() as f32
+    }
+
+    #[test]
+    fn quiet_speech_is_raised_but_peaks_stay_below_minus_3_db() {
+        // A sine at -27 dB RMS with one louder spike at -9 dB, like the real recording.
+        let mut x: Vec<f32> = (0..24_000 * 5).map(|i| (i as f32 * 0.05).sin() * 0.0632).collect();
+        x[1000] = 0.355;
+        let gain = normalize_speech(&mut x, 24_000);
+        assert!((gain - 6.0).abs() < 0.2, "gain {gain}");
+        assert!(rms_db(&x) > -21.5 && rms_db(&x) < -20.5, "rms {}", rms_db(&x));
+        let peak = x.iter().fold(0f32, |m, &s| m.max(s.abs()));
+        assert!(20.0 * peak.log10() <= -2.99);
+    }
+
+    #[test]
+    fn loud_speech_is_left_alone() {
+        let mut x: Vec<f32> = (0..24_000).map(|i| (i as f32 * 0.05).sin() * 0.2).collect();
+        assert_eq!(normalize_speech(&mut x, 24_000), 0.0);
     }
 }

@@ -125,6 +125,32 @@ async fn wait_for_enter() -> Result<()> {
     Ok(())
 }
 
+/// Raises a quiet sample towards -20 dB RMS of speech (ElevenLabs recommends -23..-18 dB) without
+/// pushing peaks above -3 dB. Never lowers the level. Returns the gain applied, in dB.
+pub(crate) fn normalize_speech(samples: &mut [f32], rate: u32) -> f32 {
+    let window = (rate / 20) as usize; // 50 ms
+    let (mut speech_sq, mut speech_n) = (0f64, 0usize);
+    for w in samples.chunks(window) {
+        let sq: f64 = w.iter().map(|&s| (s as f64) * (s as f64)).sum();
+        if 10.0 * (sq / w.len() as f64).max(1e-12).log10() >= -45.0 {
+            speech_sq += sq;
+            speech_n += w.len();
+        }
+    }
+    let peak = samples.iter().fold(0f32, |m, &s| m.max(s.abs()));
+    if speech_n == 0 || peak <= 0.0 {
+        return 0.0;
+    }
+    let speech_db = 10.0 * (speech_sq / speech_n as f64).log10() as f32;
+    let peak_db = 20.0 * peak.log10();
+    let gain_db = (-20.0 - speech_db).min(-3.0 - peak_db).max(0.0);
+    let gain = 10f32.powf(gain_db / 20.0);
+    for s in samples.iter_mut() {
+        *s *= gain;
+    }
+    gain_db
+}
+
 /// ElevenLabs rejects uploads over 11 MB. WAV samples are converted to 24 kHz mono 16-bit, which
 /// is plenty for cloning (two minutes take 5.8 MB), and split into parts when still too large.
 /// Other formats are sent as they are.
@@ -152,6 +178,10 @@ pub(crate) fn prepare_upload(path: &Path) -> Result<Vec<(String, Vec<u8>, &'stat
     let (samples, rate) = crate::audio::read_audio_file(path)?;
     let mut converted = Vec::new();
     crate::audio::Resampler::new(rate, UPLOAD_RATE).process(&samples, &mut converted);
+    let gain_db = normalize_speech(&mut converted, UPLOAD_RATE);
+    if gain_db > 0.5 {
+        println!("{}: запис тихий, підсилюю на {gain_db:.0} дБ перед завантаженням.", path.display());
+    }
     let per_part = (MAX_BYTES - 1024) / 2; // samples per part, leaving room for the WAV header
     let parts: Vec<&[f32]> = converted.chunks(per_part).collect();
     let spec = hound::WavSpec { channels: 1, sample_rate: UPLOAD_RATE, bits_per_sample: 16, sample_format: hound::SampleFormat::Int };
@@ -258,7 +288,8 @@ pub async fn record(path: &Path, seconds: u32, device: Option<&str>) -> Result<(
     if speech_db < -26.0 {
         ok = false;
         println!("  ! Мовлення тихе: ElevenLabs радить від −23 до −18 дБ. Сядь ближче до мікрофона");
-        println!("    (приблизно 20 см) або збільш його гучність і запиши ще раз.");
+        println!("    (приблизно 20 см) або збільш його гучність і запиши ще раз. Якщо не перезаписувати,");
+        println!("    clone сам підсилить запис, наскільки дозволяє запас до перевантаження.");
     } else if speech_db > -14.0 {
         ok = false;
         println!("  ! Мовлення дуже гучне: ElevenLabs радить від −23 до −18 дБ. Відсунь мікрофон або зменш гучність.");
