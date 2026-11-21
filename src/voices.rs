@@ -82,16 +82,9 @@ pub async fn clone(
         form = form.text("description", d.to_string());
     }
     for path in files {
-        let data = std::fs::read(path).with_context(|| format!("не вдалося прочитати {}", path.display()))?;
-        let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("sample.wav").to_string();
-        let mime = match path.extension().and_then(|e| e.to_str()).map(|e| e.to_lowercase()).as_deref() {
-            Some("mp3") => "audio/mpeg",
-            Some("m4a") => "audio/mp4",
-            Some("ogg") => "audio/ogg",
-            Some("flac") => "audio/flac",
-            _ => "audio/wav",
-        };
-        form = form.part("files", reqwest::multipart::Part::bytes(data).file_name(file_name).mime_str(mime)?);
+        for (file_name, data, mime) in prepare_upload(path)? {
+            form = form.part("files", reqwest::multipart::Part::bytes(data).file_name(file_name).mime_str(mime)?);
+        }
     }
     let resp = http.post(format!("{API}/v1/voices/add")).header("xi-api-key", key).multipart(form).send().await?;
     let status = resp.status();
@@ -130,6 +123,52 @@ async fn wait_for_enter() -> Result<()> {
     })
     .await??;
     Ok(())
+}
+
+/// ElevenLabs rejects uploads over 11 MB. WAV samples are converted to 24 kHz mono 16-bit, which
+/// is plenty for cloning (two minutes take 5.8 MB), and split into parts when still too large.
+/// Other formats are sent as they are.
+pub(crate) fn prepare_upload(path: &Path) -> Result<Vec<(String, Vec<u8>, &'static str)>> {
+    const UPLOAD_RATE: u32 = 24_000;
+    const MAX_BYTES: usize = 10 * 1024 * 1024;
+    let stem = path.file_stem().and_then(|n| n.to_str()).unwrap_or("sample").to_string();
+    let ext = path.extension().and_then(|e| e.to_str()).map(|e| e.to_lowercase()).unwrap_or_default();
+    if ext != "wav" {
+        let data = std::fs::read(path).with_context(|| format!("не вдалося прочитати {}", path.display()))?;
+        if data.len() > MAX_BYTES {
+            bail!("{} більший за 10 МБ; збережи його як WAV, і програма сама його зменшить", path.display());
+        }
+        let mime = match ext.as_str() {
+            "mp3" => "audio/mpeg",
+            "m4a" => "audio/mp4",
+            "ogg" => "audio/ogg",
+            "flac" => "audio/flac",
+            _ => "application/octet-stream",
+        };
+        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("sample").to_string();
+        return Ok(vec![(name, data, mime)]);
+    }
+
+    let (samples, rate) = crate::audio::read_audio_file(path)?;
+    let mut converted = Vec::new();
+    crate::audio::Resampler::new(rate, UPLOAD_RATE).process(&samples, &mut converted);
+    let per_part = (MAX_BYTES - 1024) / 2; // samples per part, leaving room for the WAV header
+    let parts: Vec<&[f32]> = converted.chunks(per_part).collect();
+    let spec = hound::WavSpec { channels: 1, sample_rate: UPLOAD_RATE, bits_per_sample: 16, sample_format: hound::SampleFormat::Int };
+    let mut out = Vec::new();
+    for (i, part) in parts.iter().enumerate() {
+        let mut cursor = std::io::Cursor::new(Vec::new());
+        {
+            let mut writer = hound::WavWriter::new(&mut cursor, spec)?;
+            for &s in part.iter() {
+                writer.write_sample(f32_to_i16(s))?;
+            }
+            writer.finalize()?;
+        }
+        let name = if parts.len() == 1 { format!("{stem}.wav") } else { format!("{stem}-{}.wav", i + 1) };
+        out.push((name, cursor.into_inner(), "audio/wav"));
+    }
+    Ok(out)
 }
 
 /// Records the microphone to a mono 16-bit WAV, showing a level meter. Ctrl+C stops early.

@@ -530,3 +530,32 @@ mod tests {
         assert_eq!(got, vec!["こんにちは！", "今日は3.5度です。", "また"]);
     }
 }
+
+#[cfg(test)]
+mod upload_tests {
+    #[test]
+    fn long_48k_wav_becomes_small_24k_upload() {
+        let dir = std::env::temp_dir().join("li-upload-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("voice.wav");
+        let spec = hound::WavSpec { channels: 1, sample_rate: 48_000, bits_per_sample: 16, sample_format: hound::SampleFormat::Int };
+        let mut w = hound::WavWriter::create(&path, spec).unwrap();
+        for i in 0..48_000 * 120 {
+            let s = (i as f32 * 2.0 * std::f32::consts::PI * 220.0 / 48_000.0).sin() * 0.3;
+            w.write_sample((s * 32767.0) as i16).unwrap();
+        }
+        w.finalize().unwrap();
+        assert!(std::fs::metadata(&path).unwrap().len() > 11 * 1000 * 1000);
+
+        let parts = crate::voices::prepare_upload(&path).unwrap();
+        assert_eq!(parts.len(), 1);
+        let (name, data, mime) = &parts[0];
+        assert_eq!((name.as_str(), *mime), ("voice.wav", "audio/wav"));
+        assert!(data.len() < 10 * 1024 * 1024, "upload is {} bytes", data.len());
+        let reader = hound::WavReader::new(std::io::Cursor::new(data.clone())).unwrap();
+        assert_eq!(reader.spec().sample_rate, 24_000);
+        let secs = reader.duration() as f32 / 24_000.0;
+        assert!((secs - 120.0).abs() < 0.1, "duration {secs}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+}
