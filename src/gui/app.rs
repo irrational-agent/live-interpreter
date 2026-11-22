@@ -662,8 +662,8 @@ impl App {
 }
 
 /// Warns when the translation goes into a Voicemeeter input while the interpreter listens to a
-/// Voicemeeter bus: on this machine AUX Input reaches bus B1, so the interpreter would hear its
-/// own speech and translate it again.
+/// Voicemeeter bus: when AUX Input is routed into that bus (often B1, the usual default
+/// microphone), the interpreter would hear its own speech and translate it again.
 fn feedback_warning(s: &Settings, default_input: Option<&str>) -> Option<&'static str> {
     let mic_output = s.mic_output.as_deref()?.to_lowercase();
     let input = s.input_device.as_deref().or(default_input).unwrap_or("").to_lowercase();

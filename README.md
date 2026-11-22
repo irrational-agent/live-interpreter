@@ -28,18 +28,40 @@ Scribe вважає фразу завершеною й надсилає її о�
 На тестових фразах звук починався через 1–2 с після того, як Scribe завершував фразу. До цього додається сама
 пауза, за якою Scribe розуміє, що фраза закінчилась.
 
-## Підготовка
+## Що потрібно
 
-Програмі потрібні два ключі. Ключ ElevenLabs відповідає за розпізнавання й озвучення, а ключ Claude API — за
-переклад. Обидва зберігаються у файлі `.env.local` у теці проекту, який не потрапляє в git. Записати ключ можна
-скриптом, який питає його в терміналі й не показує на екрані:
+- Windows 10 або 11. Програма бере японські й китайські шрифти з тих, що постачаються з Windows.
+- Rust, встановлений через [rustup](https://rustup.rs), разом із Visual Studio Build Tools, які rustup пропонує
+  поставити.
+- Акаунт [ElevenLabs](https://elevenlabs.io) із ключем API. ElevenLabs розпізнає мовлення й озвучує переклад і
+  списує за це кредити. Клон власного голосу безкоштовний план не дозволяє, для нього потрібен платний.
+- Ключ [Claude API](https://platform.claude.com/settings/keys) і гроші на рахунку Anthropic, бо переклад робить
+  Claude.
+- Мікрофон і навушники. Voicemeeter потрібен лише тоді, коли переклад має звучати як мікрофон для VRChat чи іншої
+  програми.
+
+## Встановлення
+
+Завантаж код і перейди в його теку:
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File C:\projects\live-interpreter\scripts\set-key.ps1
+git clone https://github.com/irrational-agent/live-interpreter.git
 ```
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File C:\projects\live-interpreter\scripts\set-key.ps1 -Name ANTHROPIC_API_KEY
+cd live-interpreter
+```
+
+Програмі потрібні два ключі. Ключ ElevenLabs відповідає за розпізнавання й озвучення, а ключ Claude API — за
+переклад. Обидва зберігаються у файлі `.env.local` у теці проекту, який не потрапляє в git. Записати ключ можна
+скриптом, який питає його в терміналі й не показує на екрані. Команди нижче запускай із теки проекту:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\set-key.ps1
+```
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\set-key.ps1 -Name ANTHROPIC_API_KEY
 ```
 
 Зібрати програму:
@@ -55,7 +77,7 @@ cargo build --release
 Ярлик «Синхронний перекладач» на робочому столі створює скрипт:
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File C:\projects\live-interpreter\scripts\install-shortcut.ps1
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\install-shortcut.ps1
 ```
 
 ## Вікно
@@ -79,9 +101,9 @@ powershell -NoProfile -ExecutionPolicy Bypass -File C:\projects\live-interpreter
 навушників. Якщо вибрати Voicemeeter AUX Input, а у Voicemeeter направити смугу AUX на шину, яку VRChat чи інша
 програма слухає як мікрофон, ця програма чутиме японський переклад твоїм голосом.
 
-Тут є пастка. Перекладач за замовчуванням слухає шину Voicemeeter B1, а на цьому комп'ютері AUX потрапляє саме в
-B1: під час перевірки фраза, зіграна в AUX, з'явилась на записі B1. Тоді перекладач чує власний переклад і починає
-перекладати його знову. Щоб цього не сталося, вибери в полі «Слухати мікрофон» фізичний мікрофон, а не шину
+Тут є пастка. Якщо перекладач слухає шину Voicemeeter, наприклад B1, а AUX теж іде в цю шину, перекладач чує
+власний переклад і починає перекладати його знову. Так буває, коли шина Voicemeeter стоїть у Windows мікрофоном за
+замовчуванням. Щоб цього не сталося, вибери в полі «Слухати мікрофон» фізичний мікрофон, а не шину
 Voicemeeter. Інший вихід — увімкнути «Не слухати мікрофон, поки звучить переклад», але тоді слова, сказані під час
 перекладу, губляться. Вікно попереджає про цю пастку, коли бачить таке поєднання налаштувань.
 
@@ -111,7 +133,7 @@ Voicemeeter. Інший вихід — увімкнути «Не слухати 
 | `--model claude-haiku-5-5` | перекладає швидшою моделлю |
 | `--tts-model eleven_flash_v2_5` | озвучує найдешевшою моделлю, але клон голосу нею звучить не схоже |
 | `--tts-model eleven_v4` | озвучує найякіснішою моделлю, але звук починається на кілька секунд пізніше |
-| `--input-device FIFINE`, `--output-device MR710` | вибирає мікрофон і вихід звуку за частиною назви |
+| `--input-device "USB Microphone"`, `--output-device Headphones` | вибирає мікрофон і вихід звуку за частиною назви |
 | `--mic-output "Voicemeeter AUX Input"` | грає переклад ще й у цей пристрій, щоб інші програми чули його як мікрофон |
 | `--no-monitor` | не грає переклад у навушники |
 | `--vrchat` | показує переклад у чатбоксі VRChat (адресу змінює `--vrchat-address`) |
