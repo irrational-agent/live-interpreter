@@ -19,11 +19,8 @@ pub struct Keys {
 
 /// Loads `.env.local` from the working directory or from the project folder above the executable.
 pub fn load_keys() -> Result<Keys> {
-    let mut dirs: Vec<PathBuf> = std::env::current_dir().into_iter().collect();
-    if let Ok(exe) = std::env::current_exe() {
-        dirs.extend(exe.ancestors().skip(1).map(PathBuf::from));
-    }
-    if let Some(file) = dirs.iter().map(|d| d.join(".env.local")).find(|p| p.is_file()) {
+    if let Some(dir) = crate::settings::project_dir() {
+        let file = dir.join(".env.local");
         dotenvy::from_path(&file).with_context(|| format!("не вдалося прочитати {}", file.display()))?;
     }
     let get = |name: &str| std::env::var(name).ok().filter(|v| !v.trim().is_empty());

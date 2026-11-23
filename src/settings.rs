@@ -1,4 +1,4 @@
-//! Settings shared by the window and the engine, kept in %APPDATA%\live-interpreter\settings.json.
+//! Settings shared by the window and the engine, kept in `settings.json` in the project folder.
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -62,18 +62,48 @@ impl Default for Settings {
     }
 }
 
+/// The project folder: the working directory or the nearest folder above the executable that holds
+/// `.env.local`. Keys and settings both live there.
+pub fn project_dir() -> Option<PathBuf> {
+    let mut dirs: Vec<PathBuf> = std::env::current_dir().into_iter().collect();
+    if let Ok(exe) = std::env::current_exe() {
+        dirs.extend(exe.ancestors().skip(1).map(PathBuf::from));
+    }
+    dirs.into_iter().find(|d| d.join(".env.local").is_file())
+}
+
 impl Settings {
+    /// `settings.json` in the project folder, next to `.env.local`.
+    ///
+    /// Not in %APPDATA%: when the Claude desktop app (an MSIX package) starts a program, Windows
+    /// redirects that program's AppData writes into the package, so a window opened from the
+    /// desktop shortcut would see different settings than one started from Claude.
+    /// LIVE_INTERPRETER_SETTINGS points the self-test at a file of its own.
     pub fn path() -> PathBuf {
-        let base = std::env::var_os("APPDATA").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."));
-        base.join("live-interpreter").join("settings.json")
+        if let Some(path) = std::env::var_os("LIVE_INTERPRETER_SETTINGS") {
+            return PathBuf::from(path);
+        }
+        let dir = project_dir()
+            .or_else(|| std::env::current_exe().ok().and_then(|exe| exe.parent().map(PathBuf::from)))
+            .unwrap_or_else(|| PathBuf::from("."));
+        dir.join("settings.json")
+    }
+
+    /// Where earlier versions kept the settings; read once if the new file does not exist yet.
+    fn legacy_path() -> Option<PathBuf> {
+        std::env::var_os("APPDATA").map(|base| PathBuf::from(base).join("live-interpreter").join("settings.json"))
     }
 
     /// Saved settings, or the defaults when there are none or the file is unreadable.
     pub fn load() -> Settings {
-        std::fs::read_to_string(Self::path())
-            .ok()
-            .and_then(|text| serde_json::from_str(&text).ok())
-            .unwrap_or_default()
+        let read = |path: PathBuf| -> Option<Settings> {
+            serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()
+        };
+        let current = Self::path();
+        if current.is_file() || std::env::var_os("LIVE_INTERPRETER_SETTINGS").is_some() {
+            return read(current).unwrap_or_default();
+        }
+        Self::legacy_path().and_then(read).unwrap_or_default()
     }
 
     pub fn save(&self) -> Result<()> {

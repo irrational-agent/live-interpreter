@@ -7,3 +7,6 @@
 # personal voice recordings and generated audio
 samples/
 out/
+
+# window settings (local devices and voice)
+settings.json
